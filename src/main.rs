@@ -11,6 +11,18 @@ use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
 mod leo_async;
 mod log;
 
+fn fd_check_nonblocking(fd: &ArcFd) -> DSSResult<()> {
+    let fd = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err("fcntl failed".into());
+    }
+
+    assert!(flags & libc::O_NONBLOCK != 0, "fd is not nonblocking");
+
+    Ok(())
+}
+
 fn fd_make_nonblocking(fd: &ArcFd) -> DSSResult<()> {
     let fd = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -32,7 +44,6 @@ async fn connect(addr: &std::net::SocketAddr) -> DSSResult<ArcFd> {
     fd_make_nonblocking(&sock)?;
 
     leo_async::socket::connect(&sock, addr).await?;
-    fd_make_nonblocking(&sock)?;
 
     Ok(sock)
 }
@@ -72,10 +83,7 @@ impl TlsClient {
         let sock = connect(&addr).await?;
 
         let read_sock = sock.dup()?;
-        fd_make_nonblocking(&read_sock)?;
-
         let write_sock = sock.dup()?;
-        fd_make_nonblocking(&write_sock)?;
 
         Ok(Self {
             client,
@@ -181,7 +189,7 @@ async fn tls_test() -> DSSResult<()> {
         .await?;
     client.write(b"Connection: close\r\n").await?;
     client.write(b"\r\n").await?;
-    println!("Request sent");
+    info!("Request sent");
 
     // Read and print the response until we get EOF
     let mut buf = [0; 4096];
@@ -194,7 +202,7 @@ async fn tls_test() -> DSSResult<()> {
     }
     std::io::stdout().flush()?;
 
-    println!("TLS socket closed");
+    info!("TLS socket closed");
 
     Ok(())
 }
@@ -203,9 +211,9 @@ async fn async_main() -> DSSResult<()> {
     let tls_res = tls_test();
     let tls_res = std::pin::pin!(tls_res);
     match leo_async::timeout_future(tls_res, Duration::from_secs(5)).await {
-        Ok(Ok(_)) => println!("TLS test completed successfully"),
-        Ok(Err(e)) => println!("TLS test failed: {}", e),
-        Err(_) => println!("TLS test timed out"),
+        Ok(Ok(_)) => info!("TLS test completed successfully"),
+        Ok(Err(e)) => error!("TLS test failed: {}", e),
+        Err(_) => error!("TLS test timed out"),
     }
 
     Ok(())

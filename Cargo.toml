@@ -3,6 +3,12 @@ name = "rustls-async-test"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+strip = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 libc = "0.2.172"
 chrono = "0.4.41"
