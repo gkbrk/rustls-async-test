@@ -1,8 +1,8 @@
 use std::{
     io::{Read, Write},
-    net::ToSocketAddrs,
+    net::{SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -51,45 +51,45 @@ async fn writeall(fd: &ArcFd, buf: &[u8]) -> DSSResult<()> {
     Ok(())
 }
 
-async fn tls_test() -> DSSResult<()> {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+struct TlsClient {
+    client: rustls::ClientConnection,
+    read_sock: ArcFd,
+    write_sock: ArcFd,
+}
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+impl TlsClient {
+    async fn connect(hostname: &str, addr: SocketAddr) -> DSSResult<Self> {
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let rc_config = Arc::new(config);
-    let hostname = "www.gkbrk.com";
-    let mut client = rustls::ClientConnection::new(rc_config, hostname.try_into()?)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
-    let addr = {
-        let addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
-        addresses
-            .filter(|x| x.is_ipv4())
-            .next()
-            .ok_or("No IPv4 address found")?
-    };
+        let rc_config = Arc::new(config);
+        let client = rustls::ClientConnection::new(rc_config, hostname.to_string().try_into()?)?;
 
-    let sock = connect(&addr).await?;
+        let sock = connect(&addr).await?;
 
-    let read_sock = sock.dup()?;
-    fd_make_nonblocking(&read_sock)?;
+        let read_sock = sock.dup()?;
+        fd_make_nonblocking(&read_sock)?;
 
-    let write_sock = sock.dup()?;
-    fd_make_nonblocking(&write_sock)?;
+        let write_sock = sock.dup()?;
+        fd_make_nonblocking(&write_sock)?;
 
-    {
-        let mut writer = client.writer();
-        write!(&mut writer, "GET /robots.txt HTTP/1.0\r\n")?;
-        write!(&mut writer, "Host: {}\r\n", hostname)?;
-        write!(&mut writer, "Connection: close\r\n")?;
-        write!(&mut writer, "\r\n")?;
+        Ok(Self {
+            client: client,
+            read_sock,
+            write_sock,
+        })
     }
 
-    loop {
-        match (client.wants_read(), client.wants_write()) {
-            (false, false) => break,
+    async fn run_iter(&mut self) -> DSSResult<(bool, bool)> {
+        let mut read_sock = self.read_sock.clone();
+        let mut write_sock = self.write_sock.clone();
+
+        match (self.client.wants_read(), self.client.wants_write()) {
+            (false, false) => return Ok((false, false)),
             (true, false) => {
                 fd_wait_readable(&read_sock).await?;
             }
@@ -103,34 +103,22 @@ async fn tls_test() -> DSSResult<()> {
             }
         };
 
-        if client.wants_read() && leo_async::fd_readable(&read_sock)? {
+        if self.client.wants_read() && leo_async::fd_readable(&read_sock)? {
             let mut buf = [0; 4096];
             let n = leo_async::read_fd(&read_sock, &mut buf).await?;
             if n == 0 {
-                break;
+                return Err("Read returned zero bytes".into());
             }
 
-            client.read_tls(&mut std::io::Cursor::new(&buf[..n]))?;
-            client.process_new_packets()?;
-
-            let mut plaintext = Vec::new();
-            match client.reader().read_to_end(&mut plaintext) {
-                Ok(x) => {
-                    std::io::stdout().write(&plaintext)?;
-                    std::io::stdout().write(b"\n")?;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    return Err(e.to_string().into());
-                }
-            }
+            self.client.read_tls(&mut std::io::Cursor::new(&buf[..n]))?;
+            self.client.process_new_packets()?;
         }
 
-        if client.wants_write() && leo_async::fd_writable(&write_sock)? {
+        if self.client.wants_write() && leo_async::fd_writable(&write_sock)? {
             let mut buf = [0u8; 4096];
             let mut cursor = std::io::Cursor::new(&mut buf[..]);
-            client.write_tls(&mut cursor)?;
+
+            self.client.write_tls(&mut cursor)?;
 
             let buf = {
                 let pos = cursor.position();
@@ -140,7 +128,75 @@ async fn tls_test() -> DSSResult<()> {
 
             writeall(&write_sock, buf).await?;
         }
+
+        Ok((
+            self.client.wants_read(),
+            self.client.wants_write(),
+        ))
     }
+
+    async fn read(&mut self, buf: &mut [u8]) -> DSSResult<usize> {
+        loop {
+            match self.client.reader().read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // If we would block, run the TLS iteration
+                    _ = self.run_iter().await?;
+                }
+                Err(e) => return Err(e.to_string().into()),
+            }
+        }
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> DSSResult<()> {
+        self.client.writer().write(buf)?;
+
+        // Do TLS writes until we don't want to write anymore
+
+        loop {
+            let (_wants_read, wants_write) = self.run_iter().await?;
+
+            if !wants_write {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn tls_test() -> DSSResult<()> {
+    let hostname = "www.gkbrk.com";
+
+    // Find first IPv4 address for the hostname
+    let addr = {
+        let addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
+        addresses
+            .filter(|x| x.is_ipv4())
+            .next()
+            .ok_or("No IPv4 address found")?
+    };
+
+    let mut client = TlsClient::connect(hostname, addr).await?;
+
+    client.write(b"GET /robots.txt HTTP/1.0\r\n").await?;
+    client
+        .write(format!("Host: {}\r\n", hostname).as_bytes())
+        .await?;
+    client.write(b"Connection: close\r\n").await?;
+    client.write(b"\r\n").await?;
+    println!("Request sent");
+
+    // Read and print the response until we get EOF
+    let mut buf = [0; 4096];
+    loop {
+        let n = client.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        std::io::stdout().write_all(&buf[..n])?;
+    }
+    std::io::stdout().flush()?;
 
     println!("TLS socket closed");
 
