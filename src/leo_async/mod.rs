@@ -13,7 +13,7 @@ use crate::{error, trace};
 fn noisytimer(s: &'_ str, milliseconds: u64) -> impl Drop + '_ {
     struct X<'a>(&'a str, std::time::Instant, std::time::Duration);
 
-    impl<'a> Drop for X<'a> {
+    impl Drop for X<'_> {
         fn drop(&mut self) {
             let now = std::time::Instant::now();
             let dur = now - self.1;
@@ -73,7 +73,7 @@ impl AsRawFd for ArcFd {
 }
 
 impl AsFd for ArcFd {
-    fn as_fd<'a>(&'a self) -> BorrowedFd<'a> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) }
     }
 }
@@ -181,7 +181,7 @@ pub(super) fn fd_writable(fd: &ArcFd) -> DSSResult<bool> {
         .contains(nix::poll::PollFlags::POLLOUT))
 }
 
-pub(super) fn fd_wait_readable<'a>(fd: &'a ArcFd) -> impl Future<Output = DSSResult<()>> + 'a {
+pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     std::future::poll_fn(move |cx| {
         if fd_readable(fd)? {
             return Poll::Ready(Ok(()));
@@ -197,7 +197,7 @@ pub(super) fn fd_wait_readable<'a>(fd: &'a ArcFd) -> impl Future<Output = DSSRes
     })
 }
 
-pub(super) fn fd_wait_writable<'a>(fd: &'a ArcFd) -> impl Future<Output = DSSResult<()>> + 'a {
+pub(super) fn fd_wait_writable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     std::future::poll_fn(move |cx| {
         if fd_writable(fd)? {
             return Poll::Ready(Ok(()));

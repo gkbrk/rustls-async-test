@@ -2,7 +2,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -78,15 +78,15 @@ impl TlsClient {
         fd_make_nonblocking(&write_sock)?;
 
         Ok(Self {
-            client: client,
+            client,
             read_sock,
             write_sock,
         })
     }
 
     async fn run_iter(&mut self) -> DSSResult<(bool, bool)> {
-        let mut read_sock = self.read_sock.clone();
-        let mut write_sock = self.write_sock.clone();
+        let read_sock = self.read_sock.clone();
+        let write_sock = self.write_sock.clone();
 
         match (self.client.wants_read(), self.client.wants_write()) {
             (false, false) => return Ok((false, false)),
@@ -129,10 +129,7 @@ impl TlsClient {
             writeall(&write_sock, buf).await?;
         }
 
-        Ok((
-            self.client.wants_read(),
-            self.client.wants_write(),
-        ))
+        Ok((self.client.wants_read(), self.client.wants_write()))
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> DSSResult<usize> {
@@ -148,8 +145,8 @@ impl TlsClient {
         }
     }
 
-    async fn write(&mut self, buf: &[u8]) -> DSSResult<()> {
-        self.client.writer().write(buf)?;
+    async fn write(&mut self, buf: &[u8]) -> DSSResult<usize> {
+        let written = self.client.writer().write(buf)?;
 
         // Do TLS writes until we don't want to write anymore
 
@@ -161,7 +158,7 @@ impl TlsClient {
             }
         }
 
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -170,10 +167,9 @@ async fn tls_test() -> DSSResult<()> {
 
     // Find first IPv4 address for the hostname
     let addr = {
-        let addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
+        let mut addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
         addresses
-            .filter(|x| x.is_ipv4())
-            .next()
+            .find(|x| x.is_ipv4())
             .ok_or("No IPv4 address found")?
     };
 
