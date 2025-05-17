@@ -72,7 +72,10 @@ fn fd_make_nonblocking(fd: &ArcFd) -> DSSResult<()> {
 }
 
 async fn connect(addr: &std::net::SocketAddr) -> DSSResult<ArcFd> {
-    let sock = leo_async::socket::socket()?;
+    let sock = match addr {
+        SocketAddr::V4(_) => leo_async::socket::socket()?,
+        SocketAddr::V6(_) => leo_async::socket::socket6()?,
+    };
     fd_make_nonblocking(&sock)?;
 
     leo_async::socket::connect(&sock, addr).await?;
@@ -460,14 +463,18 @@ async fn websocket_test(
     event_sender: leo_async::mpsc::Sender<JsonValue>,
     hostname: &str,
 ) -> DSSResult<()> {
-    let addr = {
-        let _prof = leo_async::drop_profiler("dns in websocket_test");
-
-        let mut addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
-        addresses
-            .find(|x| x.is_ipv4())
-            .ok_or("No IPv4 address found")?
+    let addresses = {
+        let hostname = hostname.to_string();
+        leo_async::fn_thread_future(|| -> DSSResult<Vec<SocketAddr>> {
+            match ToSocketAddrs::to_socket_addrs(&(hostname, 443)) {
+                Ok(x) => Ok(x.collect()),
+                Err(e) => Err(e.to_string().into()),
+            }
+        })
+        .await?
     };
+
+    let addr = addresses.iter().next().ok_or("No address found")?.clone();
 
     let mut client = TlsClient::connect(hostname, addr).await?;
 
