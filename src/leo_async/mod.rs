@@ -8,23 +8,57 @@ use std::{
     time::Instant,
 };
 
-use crate::{error, trace};
+use crossbeam::queue::SegQueue;
 
-pub(super) fn drop_profiler(s: &'_ str) -> impl Drop + '_ {
-    struct X<'a>(&'a str, std::time::Instant);
+use crate::{error, info, trace};
 
-    impl Drop for X<'_> {
-        fn drop(&mut self) {
-            let now = std::time::Instant::now();
-            let dur = now - self.1;
-            crate::info!("Profiler: {} took {:?}", self.0, dur);
-        }
-    }
-
-    X(s, std::time::Instant::now())
+struct InternalPollFn<F> {
+    f: F,
 }
 
-pub(super) fn noisytimer(s: &'_ str, microseconds: u64) -> impl Drop + '_ {
+impl<T, F> Future for InternalPollFn<F>
+where
+    F: FnMut(&mut std::task::Context<'_>) -> Poll<T>,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<T> {
+        let start = std::time::Instant::now();
+        let res = (unsafe { &mut self.get_unchecked_mut().f })(cx);
+        let dur = start.elapsed();
+
+        if dur.as_micros() > 100 {
+            crate::warn!("internal_poll_fn task took {:?}", dur);
+        }
+
+        res
+    }
+}
+
+fn internal_poll_fn<T, F>(f: F) -> InternalPollFn<F>
+where
+    F: FnMut(&mut std::task::Context<'_>) -> Poll<T>,
+{
+    InternalPollFn { f }
+}
+
+fn make_threadpool(num_threads: usize) -> crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>>
+{
+    let (tx, rx) = crossbeam::channel::unbounded();
+
+    for _ in 0..num_threads {
+        let rx: crossbeam::channel::Receiver<Box<dyn FnOnce() + Send + 'static>> = rx.clone();
+        std::thread::spawn(move || {
+            while let Ok(f) = rx.recv() {
+                f();
+            }
+        });
+    }
+
+    return tx;
+}
+
+pub(crate) fn noisytimer(s: &'_ str, microseconds: u64) -> impl Drop + '_ {
     struct X<'a>(&'a str, std::time::Instant, std::time::Duration);
 
     impl Drop for X<'_> {
@@ -104,23 +138,25 @@ pub(super) type DSSResult<T> = std::result::Result<T, Box<dyn std::error::Error 
 
 struct Task {
     future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
-    sender: std::sync::mpsc::Sender<Arc<Task>>,
+    sender: Arc<SegQueue<Arc<Task>>>,
 }
 
 impl std::task::Wake for Task {
     fn wake(self: Arc<Self>) {
         let sender = self.sender.clone();
-        sender.send(self).unwrap();
+        sender.push(self);
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.sender.send(self.clone()).unwrap();
+        self.sender.push(self.clone());
     }
 }
 
 static EXIT_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-static TASK_SENDER: OnceLock<RwLock<Option<std::sync::mpsc::Sender<Arc<Task>>>>> = OnceLock::new();
+static THREADPOOL_SENDER: OnceLock<crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>>> = OnceLock::new();
+
+static TASK_SENDER: OnceLock<Arc<SegQueue<Arc<Task>>>> = OnceLock::new();
 
 static EPOLL_REGISTER: LazyLock<mpsc::Sender<(ArcFd, epoll::PollType, Waker)>> =
     LazyLock::new(epoll::epoll_task);
@@ -136,11 +172,12 @@ static SLEEP_REGISTER: LazyLock<std::sync::mpsc::Sender<(Instant, Box<Waker>)>> 
 
         sender
     });
+
 pub(super) fn read_fd<'a>(
     fd: &'a ArcFd,
     buf: &'a mut [u8],
 ) -> impl Future<Output = DSSResult<usize>> + 'a {
-    std::future::poll_fn(move |cx| match nix::unistd::read(fd, buf) {
+    internal_poll_fn(move |cx| match nix::unistd::read(fd, buf) {
         Ok(n) => Poll::Ready(Ok(n)),
         Err(nix::errno::Errno::EAGAIN) => {
             EPOLL_REGISTER
@@ -156,7 +193,7 @@ pub(super) fn write_fd<'a>(
     fd: &'a ArcFd,
     buf: &'a [u8],
 ) -> impl Future<Output = DSSResult<usize>> + 'a {
-    std::future::poll_fn(move |cx| match nix::unistd::write(fd, buf) {
+    internal_poll_fn(move |cx| match nix::unistd::write(fd, buf) {
         Ok(n) => Poll::Ready(Ok(n)),
         Err(nix::errno::Errno::EAGAIN) => {
             EPOLL_REGISTER
@@ -199,7 +236,7 @@ pub(super) fn fd_writable(fd: &ArcFd) -> DSSResult<bool> {
 }
 
 pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
-    std::future::poll_fn(move |cx| {
+    internal_poll_fn(move |cx| {
         if { fd_readable(fd)? } {
             return Poll::Ready(Ok(()));
         }
@@ -215,7 +252,7 @@ pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>
 }
 
 pub(super) fn fd_wait_writable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
-    std::future::poll_fn(move |cx| {
+    internal_poll_fn(move |cx| {
         if { fd_writable(fd)? } {
             return Poll::Ready(Ok(()));
         }
@@ -234,14 +271,7 @@ pub(super) fn spawn<F, T>(future: F)
 where
     F: Future<Output = T> + Send + 'static,
 {
-    let sender = TASK_SENDER
-        .get()
-        .unwrap()
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .clone();
+    let sender = TASK_SENDER.get().unwrap();
 
     let future = async {
         _ = future.await;
@@ -252,7 +282,7 @@ where
         sender: sender.clone(),
     });
 
-    sender.send(task).unwrap();
+    sender.push(task);
 }
 
 pub(super) fn run_main<F, T>(future: F) -> T
@@ -260,10 +290,13 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static + std::fmt::Debug,
 {
+    THREADPOOL_SENDER.set(make_threadpool(32)).unwrap();
+
     let task_receiver = {
-        let (task_sender, task_receiver) = std::sync::mpsc::channel();
-        TASK_SENDER.set(RwLock::new(Some(task_sender))).unwrap();
-        task_receiver
+        let q = SegQueue::new();
+        let q = Arc::new(q);
+        TASK_SENDER.set(q.clone()).unwrap();
+        q
     };
     let t = std::thread::spawn(|| run_forever(task_receiver));
 
@@ -295,7 +328,7 @@ where
     let pollfn = {
         let result = result.clone();
         let waker = waker.clone();
-        std::future::poll_fn(move |ctx| {
+        internal_poll_fn(move |ctx| {
             waker.lock().unwrap().replace(ctx.waker().clone());
 
             match result.lock().unwrap().take() {
@@ -305,44 +338,39 @@ where
         })
     };
 
-    std::thread::spawn(move || {
+    let sender = THREADPOOL_SENDER.get().expect("Threadpool not initialized");
+    sender.send(Box::new(move || {
         let res = f();
         result.lock().unwrap().replace(res);
 
         loop {
             match waker.lock().unwrap().take() {
-                Some(waker) => {
-                    waker.wake();
+                Some(w) => {
+                    w.wake();
                     break;
                 }
                 None => std::thread::yield_now(),
             }
         }
-    });
+    })).expect("Failed to send task to threadpool");
 
     pollfn
 }
 
-fn run_forever(task_receiver: std::sync::mpsc::Receiver<Arc<Task>>) {
+fn run_forever(task_receiver: Arc<SegQueue<Arc<Task>>>) {
     loop {
         let mut task_set = HashMap::new();
 
-        match task_receiver.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(task) => {
+        loop {
+            if let Some(task) = task_receiver.pop() {
                 task_set.insert(Arc::as_ptr(&task), task);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if EXIT_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
+            } else {
+                if task_set.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
                 }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 break;
             }
-        }
-
-        for task in task_receiver.try_iter() {
-            task_set.insert(Arc::as_ptr(&task), task);
         }
 
         crate::trace!("Running {} tasks", task_set.len());
@@ -371,7 +399,7 @@ pub(super) fn sleep_seconds(seconds: impl Into<f64>) -> impl Future<Output = ()>
     let seconds = seconds.into();
     let target = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
 
-    std::future::poll_fn(move |cx| {
+    internal_poll_fn(move |cx| {
         let now = std::time::Instant::now();
 
         if now >= target {
@@ -496,6 +524,8 @@ pub(super) mod mpsc {
         task::{Poll, Waker},
     };
 
+    use super::internal_poll_fn;
+
     struct Inner<T> {
         q: VecDeque<T>,
         waker: Option<Waker>,
@@ -558,7 +588,7 @@ pub(super) mod mpsc {
 
     impl<T> Receiver<T> {
         pub fn recv(&self) -> impl Future<Output = Option<T>> + '_ {
-            std::future::poll_fn(|ctx| {
+            internal_poll_fn(|ctx| {
                 let mut inner = self.inner.lock().unwrap();
 
                 if let Some(value) = inner.q.pop_front() {

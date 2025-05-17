@@ -10,6 +10,7 @@ lto = "fat"
 codegen-units = 1
 
 [dependencies]
+crossbeam = "0.8.4"
 libc = "0.2.172"
 chrono = "0.4.41"
 rustls = "0.23.27"

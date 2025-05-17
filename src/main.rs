@@ -1,3 +1,5 @@
+#![feature(backtrace_frames)]
+
 use std::{
     collections::VecDeque,
     io::{BufRead, Read, Write},
@@ -7,12 +9,15 @@ use std::{
     vec,
 };
 
+use cowboy::*;
+
 use json::JsonValue;
 use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
 
 mod dotenv;
 mod leo_async;
 mod log;
+mod cowboy;
 
 impl Read for ArcFd {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -107,7 +112,7 @@ async fn writeall(fd: &ArcFd, buf: &[u8]) -> DSSResult<()> {
 }
 
 struct TlsClient {
-    client: rustls::ClientConnection,
+    client: cowboy::Cowboy<rustls::ClientConnection>,
     read_sock: ArcFd,
     write_sock: ArcFd,
 }
@@ -134,7 +139,7 @@ impl TlsClient {
         fd_check_nonblocking(&write_sock)?;
 
         Ok(Self {
-            client,
+            client: client.cowboy(),
             read_sock,
             write_sock,
         })
@@ -145,7 +150,7 @@ impl TlsClient {
         let mut read_sock = self.read_sock.clone();
         let mut write_sock = self.write_sock.clone();
 
-        match (self.client.wants_read(), self.client.wants_write()) {
+        match {(self.client.r().wants_read(), self.client.r().wants_write())} {
             (false, false) => return Ok((false, false)),
             (true, false) => {
                 fd_wait_readable(&read_sock).await?;
@@ -160,46 +165,63 @@ impl TlsClient {
             }
         };
 
-        if self.client.wants_read() && leo_async::fd_readable(&read_sock)? {
-            match self.client.read_tls(&mut read_sock) {
-                Ok(0) => {
-                    // EOF
-                    return Ok((false, false));
-                }
-                Ok(_x) => {
-                    self.client.process_new_packets()?;
-                }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        return Err(e.to_string().into());
+        leo_async::yield_now().await;
+
+        if self.client.r().wants_read() {
+            let readable = {
+                leo_async::fd_readable(&read_sock)?
+            };
+            if readable {
+                match {self.client.w().read_tls(&mut read_sock)} {
+                    Ok(0) => {
+                        // EOF
+                        return Ok((false, false));
+                    }
+                    Ok(_x) => {
+                        let c = self.client.clone();
+                        leo_async::fn_thread_future(move || c.w().process_new_packets()).await?;
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(e.to_string().into());
+                        }
                     }
                 }
             }
         }
 
-        if self.client.wants_write() && leo_async::fd_writable(&write_sock)? {
-            match self.client.write_tls(&mut write_sock) {
-                Ok(0) => {
-                    // EOF
-                    return Ok((false, false));
-                }
-                Ok(_x) => {
-                    // Successfully wrote
-                }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        return Err(e.to_string().into());
+        leo_async::yield_now().await;
+
+        if self.client.r().wants_write() {
+            let writable = {
+                leo_async::fd_writable(&write_sock)?
+            };
+            if writable {
+                match self.client.w().write_tls(&mut write_sock) {
+                    Ok(0) => {
+                        // EOF
+                        return Ok((false, false));
+                    }
+                    Ok(_x) => {
+                        // Successfully wrote
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(e.to_string().into());
+                        }
                     }
                 }
             }
         }
 
-        Ok((self.client.wants_read(), self.client.wants_write()))
+        leo_async::yield_now().await;
+
+        Ok((self.client.r().wants_read(), self.client.r().wants_write()))
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> DSSResult<usize> {
         loop {
-            match self.client.reader().read(buf) {
+            match {self.client.w().reader().read(buf)} {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // If we would block, run the TLS iteration
@@ -226,7 +248,7 @@ impl TlsClient {
 
     async fn read_line(&mut self, buf: &mut String) -> DSSResult<usize> {
         loop {
-            match self.client.reader().read_line(buf) {
+            match {self.client.w().reader().read_line(buf)} {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     _ = self.run_iter().await?;
@@ -237,7 +259,7 @@ impl TlsClient {
     }
 
     async fn write(&mut self, buf: &[u8]) -> DSSResult<usize> {
-        let written = self.client.writer().write(buf)?;
+        let written = self.client.w().writer().write(buf)?;
 
         // Do TLS writes until we don't want to write anymore
 
@@ -509,7 +531,10 @@ async fn websocket_test(
                 write_websocket_packet(&mut client, WebsocketPacket::Pong(data)).await?;
             }
             WebsocketPacket::Text(str) => {
-                let json = { json::parse(&str)? };
+                let json = leo_async::fn_thread_future(move || -> DSSResult<JsonValue> {
+                    let json = json::parse(&str)?;
+                    Ok(json)
+                }).await?;
                 if json.is_array() && json.len() == 3 {
                     let event = &json[2];
                     event_sender
