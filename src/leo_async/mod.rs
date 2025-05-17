@@ -10,7 +10,21 @@ use std::{
 
 use crate::{error, trace};
 
-fn noisytimer(s: &'_ str, milliseconds: u64) -> impl Drop + '_ {
+pub(super) fn drop_profiler(s: &'_ str) -> impl Drop + '_ {
+    struct X<'a>(&'a str, std::time::Instant);
+
+    impl Drop for X<'_> {
+        fn drop(&mut self) {
+            let now = std::time::Instant::now();
+            let dur = now - self.1;
+            crate::info!("Profiler: {} took {:?}", self.0, dur);
+        }
+    }
+
+    X(s, std::time::Instant::now())
+}
+
+pub(super) fn noisytimer(s: &'_ str, milliseconds: u64) -> impl Drop + '_ {
     struct X<'a>(&'a str, std::time::Instant, std::time::Duration);
 
     impl Drop for X<'_> {
@@ -376,7 +390,9 @@ fn get_errno() -> i32 {
 pub(super) mod socket {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use super::{ArcFd, DSSResult, get_errno};
+    use crate::{fd_wait_writable, info};
+
+    use super::{fd_readable, fd_wait_readable, get_errno, ArcFd, DSSResult};
 
     pub fn socket() -> DSSResult<ArcFd> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -387,52 +403,77 @@ pub(super) mod socket {
         }
     }
 
-    pub fn connect<'a>(
+    pub fn socket6() -> DSSResult<ArcFd> {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+
+        match fd {
+            -1 => Err("socket failed".into()),
+            fd => Ok(ArcFd::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })),
+        }
+    }
+
+    pub async fn connect<'a>(
         sock: &'a ArcFd,
         addr: &std::net::SocketAddr,
-    ) -> impl std::future::Future<Output = DSSResult<()>> + 'a {
-        let addr = match addr {
-            std::net::SocketAddr::V4(addr) => addr,
-            _ => unimplemented!(),
-        };
-
-        let sockaddr = libc::sockaddr_in {
+    ) -> DSSResult<()> {
+        let mut sockaddr = libc::sockaddr_in {
             sin_family: libc::AF_INET as u16,
             sin_port: addr.port().to_be(),
             sin_addr: libc::in_addr {
-                s_addr: addr.ip().to_bits().to_be(),
+                s_addr: 0,
             },
             sin_zero: [0; 8],
         };
 
-        std::future::poll_fn(move |ctx| {
-            let res = unsafe {
-                libc::connect(
-                    sock.as_raw_fd(),
-                    &sockaddr as *const _ as *const _,
-                    std::mem::size_of_val(&sockaddr) as u32,
-                )
-            };
+        let mut sockaddr6 = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as u16,
+            sin6_port: addr.port().to_be(),
+            sin6_addr: libc::in6_addr {
+                s6_addr: [0; 16],
+            },
+            sin6_flowinfo: 0,
+            sin6_scope_id: 0,
+        };
 
-            match res {
-                0 => std::task::Poll::Ready(DSSResult::Ok(())),
-                -1 => match get_errno() {
-                    libc::EINPROGRESS | libc::EALREADY => {
-                        super::EPOLL_REGISTER
-                            .send((
-                                sock.clone(),
-                                super::epoll::PollType::Write,
-                                ctx.waker().clone(),
-                            ))
-                            .unwrap();
-                        std::task::Poll::Pending
-                    }
-                    libc::EISCONN => std::task::Poll::Ready(DSSResult::Ok(())),
-                    _ => std::task::Poll::Ready(DSSResult::Err("connect failed".into())),
-                },
-                _ => unreachable!(),
+        match addr {
+            std::net::SocketAddr::V4(x) => {
+                sockaddr.sin_addr.s_addr = x.ip().to_bits().to_be();
             }
-        })
+            std::net::SocketAddr::V6(x) => {
+                sockaddr6.sin6_addr.s6_addr = x.ip().octets();
+            }
+        }
+
+        let size = match addr {
+            std::net::SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as u32,
+            std::net::SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        };
+
+        let addr = match addr {
+            std::net::SocketAddr::V4(_) => &sockaddr as *const _ as *const libc::sockaddr,
+            std::net::SocketAddr::V6(_) => &sockaddr6 as *const _ as *const libc::sockaddr,
+        };
+
+        let res = unsafe {
+            libc::connect(
+                sock.as_raw_fd(),
+                addr,
+                size,
+            )
+        };
+
+        match res {
+            0 => return Ok(()),
+            -1 => match get_errno() {
+                libc::EINPROGRESS | libc::EALREADY => {
+                    fd_wait_writable(sock).await?;
+                    return Ok(());
+                }
+                libc::EISCONN => return Ok(()),
+                _ => return Err(format!("connect failed: {}", get_errno()).into()),
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub fn set_nodelay(fd: &ArcFd) -> DSSResult<()> {

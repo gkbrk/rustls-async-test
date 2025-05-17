@@ -4,11 +4,14 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     sync::Arc,
-    time::Duration, vec,
+    time::Duration,
+    vec,
 };
 
-use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
+use json::JsonValue;
+use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable, read_fd};
 
+mod dotenv;
 mod leo_async;
 mod log;
 
@@ -114,6 +117,10 @@ impl TlsClient {
         let read_sock = sock.dup()?;
         let write_sock = sock.dup()?;
 
+        fd_check_nonblocking(&sock)?;
+        fd_check_nonblocking(&read_sock)?;
+        fd_check_nonblocking(&write_sock)?;
+
         Ok(Self {
             client,
             read_sock,
@@ -147,6 +154,7 @@ impl TlsClient {
                     return Ok((false, false));
                 }
                 Ok(_x) => {
+                    let _prof = leo_async::noisytimer("process_new_packets", 1);
                     self.client.process_new_packets()?;
                 }
                 Err(e) => {
@@ -246,12 +254,15 @@ impl TlsClient {
 
 async fn websocket_handshake(sock: &mut TlsClient, hostname: &str) -> DSSResult<()> {
     sock.write_all(b"GET / HTTP/1.1\r\n").await?;
-    sock.write_all(format!("Host: {}\r\n", hostname).as_bytes()).await?;
+    sock.write_all(format!("Host: {}\r\n", hostname).as_bytes())
+        .await?;
     sock.write_all(b"Upgrade: websocket\r\n").await?;
     sock.write_all(b"Connection: Upgrade\r\n").await?;
-    sock.write_all(b"Sec-WebSocket-Key: eWVsbG93IHN1Ym1hcmluZQ==\r\n").await?;
+    sock.write_all(b"Sec-WebSocket-Key: eWVsbG93IHN1Ym1hcmluZQ==\r\n")
+        .await?;
     sock.write_all(b"Sec-WebSocket-Version: 13\r\n").await?;
-    sock.write_all(format!("Origin: https://{}\r\n", hostname).as_bytes()).await?;
+    sock.write_all(format!("Origin: https://{}\r\n", hostname).as_bytes())
+        .await?;
     sock.write_all(b"\r\n").await?;
 
     async fn read_line(sock: &mut TlsClient) -> DSSResult<String> {
@@ -359,9 +370,7 @@ enum WebsocketPacket {
     NothingToSeeHere,
 }
 
-async fn read_websocket_packet(
-    sock: &mut TlsClient,
-) -> DSSResult<WebsocketPacket> {
+async fn read_websocket_packet(sock: &mut TlsClient) -> DSSResult<WebsocketPacket> {
     let header = WebsocketFrameHeader::read_async(sock).await?;
 
     if header.payload_len > 32_768 {
@@ -403,17 +412,14 @@ async fn read_websocket_packet(
     Ok(packet)
 }
 
-async fn write_websocket_packet(
-    sock: &mut TlsClient,
-    packet: WebsocketPacket,
-) -> DSSResult<()> {
+async fn write_websocket_packet(sock: &mut TlsClient, packet: WebsocketPacket) -> DSSResult<()> {
     let (opcode, mut payload) = match packet {
         WebsocketPacket::Text(text) => (0x1, text.into_bytes()),
         WebsocketPacket::Binary(data) => (0x2, data),
         WebsocketPacket::ConnectionClose => (0x8, vec![]),
         WebsocketPacket::Ping(data) => (0x9, data),
         WebsocketPacket::Pong(data) => (0xA, data),
-        WebsocketPacket::NothingToSeeHere => return Ok(())
+        WebsocketPacket::NothingToSeeHere => return Ok(()),
     };
 
     let payload_len = payload.len() as u64;
@@ -450,9 +456,13 @@ async fn write_websocket_packet(
     Ok(())
 }
 
-async fn websocket_test() -> DSSResult<()> {
-    let hostname = "bostr.bitcointxoko.com";
+async fn websocket_test(
+    event_sender: leo_async::mpsc::Sender<JsonValue>,
+    hostname: &str,
+) -> DSSResult<()> {
     let addr = {
+        let _prof = leo_async::drop_profiler("dns in websocket_test");
+
         let mut addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
         addresses
             .find(|x| x.is_ipv4())
@@ -465,19 +475,137 @@ async fn websocket_test() -> DSSResult<()> {
     websocket_handshake(&mut client, hostname).await?;
     info!("WebSocket handshake completed");
 
-    write_websocket_packet(
-        &mut client,
-        WebsocketPacket::Ping(b"hey there :)".to_vec()),
-    ).await?;
+    write_websocket_packet(&mut client, WebsocketPacket::Ping(b"hey there :)".to_vec())).await?;
 
     write_websocket_packet(
         &mut client,
         WebsocketPacket::Text("[\"REQ\",\"a\",{\"limit\":0}]".to_string()),
-    ).await?;
+    )
+    .await?;
 
     loop {
+        leo_async::yield_now().await;
         let msg = read_websocket_packet(&mut client).await?;
-        // println!("Received: {:?}", msg);
+        match msg {
+            WebsocketPacket::Ping(data) => {
+                write_websocket_packet(&mut client, WebsocketPacket::Pong(data)).await?;
+            }
+            WebsocketPacket::Text(str) => {
+                let json = {
+                    let _prof = leo_async::noisytimer("json parse", 1);
+                    json::parse(&str)?
+                };
+                if json.is_array() && json.len() == 3 {
+                    let event = &json[2];
+                    event_sender
+                        .send(event.clone())
+                        .map_err(|_| "".to_string())?;
+                }
+            }
+            WebsocketPacket::ConnectionClose => {
+                info!("Connection closed");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn tls_websocket_task(
+    sender: leo_async::mpsc::Sender<JsonValue>,
+    hostname: &str,
+) -> DSSResult<()> {
+    loop {
+        match websocket_test(sender.clone(), hostname).await {
+            Ok(_) => {
+                info!("Connection closed but no error?");
+            }
+            Err(e) => {
+                error!("WebSocket error: {}", e);
+            }
+        }
+        leo_async::sleep_seconds(15).await;
+    }
+}
+
+async fn message_to_ch_task(recv: leo_async::mpsc::Receiver<json::JsonValue>) -> DSSResult<()> {
+    let mut event_buffer = VecDeque::new();
+
+    loop {
+        match recv.recv().await {
+            Some(msg) => {
+                event_buffer.push_back(msg);
+
+                if event_buffer.len() == 64 {
+                    let conf = dotenv::load_dotenv(".env")?;
+
+                    let host = conf.get("CLICKHOUSE_HOST").ok_or("No host in config")?;
+                    let port = conf.get("CLICKHOUSE_PORT").ok_or("No port in config")?;
+                    let user = conf.get("CLICKHOUSE_USER").ok_or("No user in config")?;
+                    let password = conf
+                        .get("CLICKHOUSE_PASSWORD")
+                        .ok_or("No password in config")?;
+                    let database = conf
+                        .get("CLICKHOUSE_DATABASE")
+                        .ok_or("No database in config")?;
+
+                    let addr = {
+                        let a =
+                            ToSocketAddrs::to_socket_addrs(&(host.clone(), port.parse::<u16>()?))?
+                                .next()
+                                .ok_or("No address found")?;
+                        a
+                    };
+
+                    let sock = match addr {
+                        SocketAddr::V4(_) => leo_async::socket::socket()?,
+                        SocketAddr::V6(_) => leo_async::socket::socket6()?,
+                    };
+
+                    fd_make_nonblocking(&sock)?;
+                    leo_async::socket::connect(&sock, &addr).await?;
+                    fd_make_nonblocking(&sock)?;
+
+                    let mut buf: Vec<u8> = Vec::new();
+
+                    writeln!(
+                        &mut buf,
+                        "insert into event settings async_insert = 1, wait_for_async_insert = 0 format JSONEachRow",
+                    )?;
+
+                    for event in &event_buffer {
+                        writeln!(&mut buf, "{}", event.dump())?;
+                    }
+
+                    event_buffer.clear();
+
+                    writeall(
+                        &sock,
+                        format!(
+                            "POST /?user={}&password={}&database={} HTTP/1.1\r\n",
+                            user, password, database
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    writeall(&sock, b"Connection: close\r\n").await?;
+                    writeall(
+                        &sock,
+                        format!("Content-Length: {}\r\n", buf.len()).as_bytes(),
+                    )
+                    .await?;
+                    writeall(&sock, b"\r\n").await?;
+
+                    writeall(&sock, &buf).await?;
+                }
+            }
+            None => {
+                error!("Error receiving message");
+                break;
+            }
+        }
     }
 
     Ok(())
@@ -521,10 +649,27 @@ async fn tls_test() -> DSSResult<()> {
 }
 
 async fn async_main() -> DSSResult<()> {
-    match websocket_test().await {
-        Ok(_) => info!("WebSocket test completed successfully"),
-        Err(e) => error!("WebSocket test failed: {}", e),
-    }
+    let (event_sender, event_receiver) = leo_async::mpsc::channel();
+
+    leo_async::spawn(tls_websocket_task(
+        event_sender.clone(),
+        "bostr.bitcointxoko.com",
+    ));
+    leo_async::spawn(tls_websocket_task(
+        event_sender.clone(),
+        "wheat.happytavern.co",
+    ));
+    leo_async::spawn(tls_websocket_task(
+        event_sender.clone(),
+        "relay02.lnfi.network",
+    ));
+    leo_async::spawn(tls_websocket_task(event_sender.clone(), "nostr.gleeze.com"));
+    leo_async::spawn(tls_websocket_task(
+        event_sender.clone(),
+        "multiplexer.huszonegy.world",
+    ));
+
+    message_to_ch_task(event_receiver).await?;
 
     Ok(())
 }
