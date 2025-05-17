@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    os::fd::{self, AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     pin::Pin,
     sync::{Arc, LazyLock, Mutex, OnceLock, RwLock},
     task::{Poll, Waker},
@@ -24,7 +24,7 @@ pub(super) fn drop_profiler(s: &'_ str) -> impl Drop + '_ {
     X(s, std::time::Instant::now())
 }
 
-pub(super) fn noisytimer(s: &'_ str, milliseconds: u64) -> impl Drop + '_ {
+pub(super) fn noisytimer(s: &'_ str, microseconds: u64) -> impl Drop + '_ {
     struct X<'a>(&'a str, std::time::Instant, std::time::Duration);
 
     impl Drop for X<'_> {
@@ -43,7 +43,7 @@ pub(super) fn noisytimer(s: &'_ str, milliseconds: u64) -> impl Drop + '_ {
     X(
         s,
         std::time::Instant::now(),
-        std::time::Duration::from_millis(milliseconds),
+        std::time::Duration::from_micros(microseconds),
     )
 }
 
@@ -136,7 +136,6 @@ static SLEEP_REGISTER: LazyLock<std::sync::mpsc::Sender<(Instant, Box<Waker>)>> 
 
         sender
     });
-
 pub(super) fn read_fd<'a>(
     fd: &'a ArcFd,
     buf: &'a mut [u8],
@@ -174,7 +173,9 @@ pub(super) fn fd_readable(fd: &ArcFd) -> DSSResult<bool> {
         fd.as_fd(),
         nix::poll::PollFlags::POLLIN,
     )];
-    nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO)?;
+    {
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO)?;
+    }
 
     Ok(fds[0]
         .revents()
@@ -187,7 +188,9 @@ pub(super) fn fd_writable(fd: &ArcFd) -> DSSResult<bool> {
         fd.as_fd(),
         nix::poll::PollFlags::POLLOUT,
     )];
-    nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO)?;
+    {
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO)?;
+    }
 
     Ok(fds[0]
         .revents()
@@ -197,7 +200,7 @@ pub(super) fn fd_writable(fd: &ArcFd) -> DSSResult<bool> {
 
 pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     std::future::poll_fn(move |cx| {
-        if fd_readable(fd)? {
+        if { fd_readable(fd)? } {
             return Poll::Ready(Ok(()));
         }
 
@@ -213,7 +216,7 @@ pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>
 
 pub(super) fn fd_wait_writable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     std::future::poll_fn(move |cx| {
-        if fd_writable(fd)? {
+        if { fd_writable(fd)? } {
             return Poll::Ready(Ok(()));
         }
 
@@ -345,7 +348,7 @@ fn run_forever(task_receiver: std::sync::mpsc::Receiver<Arc<Task>>) {
         crate::trace!("Running {} tasks", task_set.len());
 
         for (_, task) in task_set.drain() {
-            let _timer = noisytimer("future poll", 1);
+            let _timer = noisytimer("future poll", 500);
             let waker = std::task::Waker::from(task.clone());
             let context = &mut std::task::Context::from_waker(&waker);
 
@@ -390,9 +393,9 @@ fn get_errno() -> i32 {
 pub(super) mod socket {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use crate::{fd_wait_writable, info};
+    use crate::fd_wait_writable;
 
-    use super::{fd_readable, fd_wait_readable, get_errno, ArcFd, DSSResult};
+    use super::{ArcFd, DSSResult, get_errno};
 
     pub fn socket() -> DSSResult<ArcFd> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -412,25 +415,18 @@ pub(super) mod socket {
         }
     }
 
-    pub async fn connect<'a>(
-        sock: &'a ArcFd,
-        addr: &std::net::SocketAddr,
-    ) -> DSSResult<()> {
+    pub async fn connect<'a>(sock: &'a ArcFd, addr: &std::net::SocketAddr) -> DSSResult<()> {
         let mut sockaddr = libc::sockaddr_in {
             sin_family: libc::AF_INET as u16,
             sin_port: addr.port().to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: 0,
-            },
+            sin_addr: libc::in_addr { s_addr: 0 },
             sin_zero: [0; 8],
         };
 
         let mut sockaddr6 = libc::sockaddr_in6 {
             sin6_family: libc::AF_INET6 as u16,
             sin6_port: addr.port().to_be(),
-            sin6_addr: libc::in6_addr {
-                s6_addr: [0; 16],
-            },
+            sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
             sin6_flowinfo: 0,
             sin6_scope_id: 0,
         };
@@ -454,13 +450,7 @@ pub(super) mod socket {
             std::net::SocketAddr::V6(_) => &sockaddr6 as *const _ as *const libc::sockaddr,
         };
 
-        let res = unsafe {
-            libc::connect(
-                sock.as_raw_fd(),
-                addr,
-                size,
-            )
-        };
+        let res = unsafe { libc::connect(sock.as_raw_fd(), addr, size) };
 
         match res {
             0 => return Ok(()),
@@ -471,7 +461,7 @@ pub(super) mod socket {
                 }
                 libc::EISCONN => return Ok(()),
                 _ => return Err(format!("connect failed: {}", get_errno()).into()),
-            }
+            },
             _ => unreachable!(),
         }
     }

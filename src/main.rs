@@ -4,12 +4,11 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     sync::Arc,
-    time::Duration,
     vec,
 };
 
 use json::JsonValue;
-use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable, read_fd};
+use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
 
 mod dotenv;
 mod leo_async;
@@ -18,24 +17,34 @@ mod log;
 impl Read for ArcFd {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let raw_fd = self.as_raw_fd();
-        nix::unistd::read(self, buf).map_err(|e| {
-            std::io::Error::new(
+        match nix::unistd::read(self, buf) {
+            Ok(n) => Ok(n),
+            Err(nix::errno::Errno::EAGAIN) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "read would block",
+            )),
+            Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to read from fd {}: {}", raw_fd, e),
-            )
-        })
+            )),
+        }
     }
 }
 
 impl Write for ArcFd {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let raw_fd = self.as_raw_fd();
-        nix::unistd::write(self, buf).map_err(|e| {
-            std::io::Error::new(
+        match nix::unistd::write(self, buf) {
+            Ok(n) => Ok(n),
+            Err(nix::errno::Errno::EAGAIN) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "write would block",
+            )),
+            Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to write to fd {}: {}", raw_fd, e),
-            )
-        })
+            )),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -132,6 +141,7 @@ impl TlsClient {
     }
 
     async fn run_iter(&mut self) -> DSSResult<(bool, bool)> {
+        leo_async::yield_now().await;
         let mut read_sock = self.read_sock.clone();
         let mut write_sock = self.write_sock.clone();
 
@@ -157,7 +167,6 @@ impl TlsClient {
                     return Ok((false, false));
                 }
                 Ok(_x) => {
-                    let _prof = leo_async::noisytimer("process_new_packets", 1);
                     self.client.process_new_packets()?;
                 }
                 Err(e) => {
@@ -465,13 +474,15 @@ async fn websocket_test(
 ) -> DSSResult<()> {
     let addresses = {
         let hostname = hostname.to_string();
-        leo_async::fn_thread_future(|| -> DSSResult<Vec<SocketAddr>> {
-            match ToSocketAddrs::to_socket_addrs(&(hostname, 443)) {
+        let hostname_for_async_block = hostname.clone();
+        let result = leo_async::fn_thread_future(move || -> DSSResult<Vec<SocketAddr>> {
+            match ToSocketAddrs::to_socket_addrs(&(hostname_for_async_block, 443)) {
                 Ok(x) => Ok(x.collect()),
                 Err(e) => Err(e.to_string().into()),
             }
         })
-        .await?
+        .await?;
+        result
     };
 
     let addr = addresses.iter().next().ok_or("No address found")?.clone();
@@ -498,10 +509,7 @@ async fn websocket_test(
                 write_websocket_packet(&mut client, WebsocketPacket::Pong(data)).await?;
             }
             WebsocketPacket::Text(str) => {
-                let json = {
-                    let _prof = leo_async::noisytimer("json parse", 1);
-                    json::parse(&str)?
-                };
+                let json = { json::parse(&str)? };
                 if json.is_array() && json.len() == 3 {
                     let event = &json[2];
                     event_sender
@@ -525,7 +533,8 @@ async fn tls_websocket_task(
     hostname: &str,
 ) -> DSSResult<()> {
     loop {
-        match websocket_test(sender.clone(), hostname).await {
+        let result = websocket_test(sender.clone(), hostname).await;
+        match result {
             Ok(_) => {
                 info!("Connection closed but no error?");
             }
@@ -540,40 +549,47 @@ async fn tls_websocket_task(
 async fn message_to_ch_task(recv: leo_async::mpsc::Receiver<json::JsonValue>) -> DSSResult<()> {
     let mut event_buffer = VecDeque::new();
 
+    let conf = dotenv::load_dotenv(".env")?;
+    let host = conf
+        .get("CLICKHOUSE_HOST")
+        .ok_or("No host in config")?
+        .clone();
+    let port_str = conf
+        .get("CLICKHOUSE_PORT")
+        .ok_or("No port in config")?
+        .clone();
+    let port = port_str.parse::<u16>()?;
+    let user = conf
+        .get("CLICKHOUSE_USER")
+        .ok_or("No user in config")?
+        .clone();
+    let password = conf
+        .get("CLICKHOUSE_PASSWORD")
+        .ok_or("No password in config")?
+        .clone();
+    let database = conf
+        .get("CLICKHOUSE_DATABASE")
+        .ok_or("No database in config")?
+        .clone();
+
+    let ch_addr = ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))?
+        .next()
+        .ok_or("No address found for ClickHouse")?;
+
     loop {
-        match recv.recv().await {
+        let received_message = recv.recv().await;
+        match received_message {
             Some(msg) => {
                 event_buffer.push_back(msg);
 
                 if event_buffer.len() == 64 {
-                    let conf = dotenv::load_dotenv(".env")?;
-
-                    let host = conf.get("CLICKHOUSE_HOST").ok_or("No host in config")?;
-                    let port = conf.get("CLICKHOUSE_PORT").ok_or("No port in config")?;
-                    let user = conf.get("CLICKHOUSE_USER").ok_or("No user in config")?;
-                    let password = conf
-                        .get("CLICKHOUSE_PASSWORD")
-                        .ok_or("No password in config")?;
-                    let database = conf
-                        .get("CLICKHOUSE_DATABASE")
-                        .ok_or("No database in config")?;
-
-                    let addr = {
-                        let a =
-                            ToSocketAddrs::to_socket_addrs(&(host.clone(), port.parse::<u16>()?))?
-                                .next()
-                                .ok_or("No address found")?;
-                        a
-                    };
-
-                    let sock = match addr {
+                    let sock = match ch_addr {
                         SocketAddr::V4(_) => leo_async::socket::socket()?,
                         SocketAddr::V6(_) => leo_async::socket::socket6()?,
                     };
 
                     fd_make_nonblocking(&sock)?;
-                    leo_async::socket::connect(&sock, &addr).await?;
-                    fd_make_nonblocking(&sock)?;
+                    leo_async::socket::connect(&sock, &ch_addr).await?;
 
                     let mut buf: Vec<u8> = Vec::new();
 
