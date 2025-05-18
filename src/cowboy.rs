@@ -6,7 +6,9 @@ pub struct Cowboy<T> {
 
 impl<T> Cowboy<T> {
     pub fn new(inner: T) -> Self {
-        Cowboy { inner: Arc::new(RwLock::new(inner)) }
+        Cowboy {
+            inner: Arc::new(RwLock::new(inner)),
+        }
     }
 
     pub fn read(&self) -> std::sync::RwLockReadGuard<T> {

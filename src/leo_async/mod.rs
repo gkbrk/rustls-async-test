@@ -11,6 +11,9 @@ use std::{
 use crossbeam::queue::SegQueue;
 
 use crate::{error, info, trace};
+pub(crate) use async_read::{AsyncRead, AsyncWrite};
+
+mod async_read;
 
 struct InternalPollFn<F> {
     f: F,
@@ -42,8 +45,9 @@ where
     InternalPollFn { f }
 }
 
-fn make_threadpool(num_threads: usize) -> crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>>
-{
+fn make_threadpool(
+    num_threads: usize,
+) -> crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>> {
     let (tx, rx) = crossbeam::channel::unbounded();
 
     for _ in 0..num_threads {
@@ -95,7 +99,13 @@ impl ArcFd {
         let res = unsafe { libc::dup(fd) };
         match res {
             -1 => Err("dup failed".into()),
-            fd => Ok(ArcFd::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })),
+            fd => Ok(ArcFd::from_raw_fd(fd)),
+        }
+    }
+
+    pub(crate) fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
+        ArcFd {
+            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
         }
     }
 }
@@ -154,7 +164,8 @@ impl std::task::Wake for Task {
 
 static EXIT_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-static THREADPOOL_SENDER: OnceLock<crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>>> = OnceLock::new();
+static THREADPOOL_SENDER: OnceLock<crossbeam::channel::Sender<Box<dyn FnOnce() + Send + 'static>>> =
+    OnceLock::new();
 
 static TASK_SENDER: OnceLock<Arc<SegQueue<Arc<Task>>>> = OnceLock::new();
 
@@ -339,20 +350,22 @@ where
     };
 
     let sender = THREADPOOL_SENDER.get().expect("Threadpool not initialized");
-    sender.send(Box::new(move || {
-        let res = f();
-        result.lock().unwrap().replace(res);
+    sender
+        .send(Box::new(move || {
+            let res = f();
+            result.lock().unwrap().replace(res);
 
-        loop {
-            match waker.lock().unwrap().take() {
-                Some(w) => {
-                    w.wake();
-                    break;
+            loop {
+                match waker.lock().unwrap().take() {
+                    Some(w) => {
+                        w.wake();
+                        break;
+                    }
+                    None => std::thread::yield_now(),
                 }
-                None => std::thread::yield_now(),
             }
-        }
-    })).expect("Failed to send task to threadpool");
+        }))
+        .expect("Failed to send task to threadpool");
 
     pollfn
 }
@@ -376,7 +389,7 @@ fn run_forever(task_receiver: Arc<SegQueue<Arc<Task>>>) {
         crate::trace!("Running {} tasks", task_set.len());
 
         for (_, task) in task_set.drain() {
-            let _timer = noisytimer("future poll", 500);
+            let _timer = noisytimer("future poll", 1500);
             let waker = std::task::Waker::from(task.clone());
             let context = &mut std::task::Context::from_waker(&waker);
 

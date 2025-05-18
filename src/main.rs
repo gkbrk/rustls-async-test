@@ -1,5 +1,3 @@
-#![feature(backtrace_frames)]
-
 use std::{
     collections::VecDeque,
     io::{BufRead, Read, Write},
@@ -13,11 +11,13 @@ use cowboy::*;
 
 use json::JsonValue;
 use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
+use metrics::metrics_server;
 
+mod cowboy;
 mod dotenv;
 mod leo_async;
 mod log;
-mod cowboy;
+mod metrics;
 
 impl Read for ArcFd {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -150,7 +150,7 @@ impl TlsClient {
         let mut read_sock = self.read_sock.clone();
         let mut write_sock = self.write_sock.clone();
 
-        match {(self.client.r().wants_read(), self.client.r().wants_write())} {
+        match { (self.client.r().wants_read(), self.client.r().wants_write()) } {
             (false, false) => return Ok((false, false)),
             (true, false) => {
                 fd_wait_readable(&read_sock).await?;
@@ -168,11 +168,9 @@ impl TlsClient {
         leo_async::yield_now().await;
 
         if self.client.r().wants_read() {
-            let readable = {
-                leo_async::fd_readable(&read_sock)?
-            };
+            let readable = { leo_async::fd_readable(&read_sock)? };
             if readable {
-                match {self.client.w().read_tls(&mut read_sock)} {
+                match { self.client.w().read_tls(&mut read_sock) } {
                     Ok(0) => {
                         // EOF
                         return Ok((false, false));
@@ -193,9 +191,7 @@ impl TlsClient {
         leo_async::yield_now().await;
 
         if self.client.r().wants_write() {
-            let writable = {
-                leo_async::fd_writable(&write_sock)?
-            };
+            let writable = { leo_async::fd_writable(&write_sock)? };
             if writable {
                 match self.client.w().write_tls(&mut write_sock) {
                     Ok(0) => {
@@ -221,7 +217,7 @@ impl TlsClient {
 
     async fn read(&mut self, buf: &mut [u8]) -> DSSResult<usize> {
         loop {
-            match {self.client.w().reader().read(buf)} {
+            match { self.client.w().reader().read(buf) } {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // If we would block, run the TLS iteration
@@ -248,7 +244,7 @@ impl TlsClient {
 
     async fn read_line(&mut self, buf: &mut String) -> DSSResult<usize> {
         loop {
-            match {self.client.w().reader().read_line(buf)} {
+            match { self.client.w().reader().read_line(buf) } {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     _ = self.run_iter().await?;
@@ -492,13 +488,13 @@ async fn write_websocket_packet(sock: &mut TlsClient, packet: WebsocketPacket) -
 
 async fn websocket_test(
     event_sender: leo_async::mpsc::Sender<JsonValue>,
-    hostname: &str,
+    hostname: String,
+    port: u16,
 ) -> DSSResult<()> {
     let addresses = {
-        let hostname = hostname.to_string();
-        let hostname_for_async_block = hostname.clone();
+        let hostname = hostname.clone();
         let result = leo_async::fn_thread_future(move || -> DSSResult<Vec<SocketAddr>> {
-            match ToSocketAddrs::to_socket_addrs(&(hostname_for_async_block, 443)) {
+            match ToSocketAddrs::to_socket_addrs(&(hostname, port)) {
                 Ok(x) => Ok(x.collect()),
                 Err(e) => Err(e.to_string().into()),
             }
@@ -509,10 +505,10 @@ async fn websocket_test(
 
     let addr = addresses.iter().next().ok_or("No address found")?.clone();
 
-    let mut client = TlsClient::connect(hostname, addr).await?;
+    let mut client = TlsClient::connect(&hostname, addr).await?;
 
     // Do handshake
-    websocket_handshake(&mut client, hostname).await?;
+    websocket_handshake(&mut client, hostname.as_str()).await?;
     info!("WebSocket handshake completed");
 
     write_websocket_packet(&mut client, WebsocketPacket::Ping(b"hey there :)".to_vec())).await?;
@@ -534,8 +530,10 @@ async fn websocket_test(
                 let json = leo_async::fn_thread_future(move || -> DSSResult<JsonValue> {
                     let json = json::parse(&str)?;
                     Ok(json)
-                }).await?;
+                })
+                .await?;
                 if json.is_array() && json.len() == 3 {
+                    metrics::RECEIVED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let event = &json[2];
                     event_sender
                         .send(event.clone())
@@ -555,10 +553,11 @@ async fn websocket_test(
 
 async fn tls_websocket_task(
     sender: leo_async::mpsc::Sender<JsonValue>,
-    hostname: &str,
+    hostname: String,
+    port: u16,
 ) -> DSSResult<()> {
     loop {
-        let result = websocket_test(sender.clone(), hostname).await;
+        let result = websocket_test(sender.clone(), hostname.clone(), port).await;
         match result {
             Ok(_) => {
                 info!("Connection closed but no error?");
@@ -659,63 +658,31 @@ async fn message_to_ch_task(recv: leo_async::mpsc::Receiver<json::JsonValue>) ->
     Ok(())
 }
 
-async fn tls_test() -> DSSResult<()> {
-    let hostname = "www.gkbrk.com";
-
-    // Find first IPv4 address for the hostname
-    let addr = {
-        let mut addresses = ToSocketAddrs::to_socket_addrs(&(hostname, 443))?;
-        addresses
-            .find(|x| x.is_ipv4())
-            .ok_or("No IPv4 address found")?
-    };
-
-    let mut client = TlsClient::connect(hostname, addr).await?;
-
-    client.write(b"GET /robots.txt HTTP/1.0\r\n").await?;
-    client
-        .write(format!("Host: {}\r\n", hostname).as_bytes())
-        .await?;
-    client.write(b"Connection: close\r\n").await?;
-    client.write(b"\r\n").await?;
-    info!("Request sent");
-
-    // Read and print the response until we get EOF
-    let mut buf = [0; 4096];
-    loop {
-        let n = client.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        std::io::stdout().write_all(&buf[..n])?;
-    }
-    std::io::stdout().flush()?;
-
-    info!("TLS socket closed");
-
-    Ok(())
-}
-
 async fn async_main() -> DSSResult<()> {
+    leo_async::spawn(async {
+        metrics_server().await.unwrap();
+    });
+
     let (event_sender, event_receiver) = leo_async::mpsc::channel();
 
-    leo_async::spawn(tls_websocket_task(
-        event_sender.clone(),
-        "bostr.bitcointxoko.com",
-    ));
-    leo_async::spawn(tls_websocket_task(
-        event_sender.clone(),
-        "wheat.happytavern.co",
-    ));
-    leo_async::spawn(tls_websocket_task(
-        event_sender.clone(),
-        "relay02.lnfi.network",
-    ));
-    leo_async::spawn(tls_websocket_task(event_sender.clone(), "nostr.gleeze.com"));
-    leo_async::spawn(tls_websocket_task(
-        event_sender.clone(),
-        "multiplexer.huszonegy.world",
-    ));
+    let relay_list = std::fs::read_to_string("relay_list.txt")?;
+    let relays = relay_list.lines().collect::<Vec<&str>>();
+
+    for relay in relays {
+        let url = url::Url::parse(relay)?;
+        if url.scheme() != "wss" {
+            continue;
+        }
+
+        let hostname = url.host_str().ok_or("No hostname in URL")?;
+        let port = url.port().unwrap_or(443);
+
+        leo_async::spawn(tls_websocket_task(
+            event_sender.clone(),
+            hostname.to_string(),
+            port,
+        ));
+    }
 
     message_to_ch_task(event_receiver).await?;
 
