@@ -182,7 +182,12 @@ async fn handle_connection(fd: leo_async::ArcFd) -> DSSResult<()> {
             )?;
             writer.flush().await?;
         }
-        _ => {}
+        _ => {
+            write!(&mut writer, "HTTP/1.1 404 Not Found\r\n")?;
+            write!(&mut writer, "Connection: close\r\n")?;
+            write!(&mut writer, "\r\n")?;
+            writer.flush().await?;
+        }
     }
 
     Ok(())
