@@ -11,7 +11,7 @@ use cowboy::*;
 
 use json::JsonValue;
 use leo_async::{ArcFd, DSSResult, fd_wait_readable, fd_wait_writable};
-use metrics::metrics_server;
+use metrics::{AtomicU64Metric, metrics_server};
 
 mod cowboy;
 mod dotenv;
@@ -282,8 +282,8 @@ impl TlsClient {
     }
 }
 
-async fn websocket_handshake(sock: &mut TlsClient, hostname: &str) -> DSSResult<()> {
-    sock.write_all(b"GET / HTTP/1.1\r\n").await?;
+async fn websocket_handshake(sock: &mut TlsClient, hostname: &str, endpoint: &str) -> DSSResult<()> {
+    sock.write_all(format!("GET {} HTTP/1.1\r\n", endpoint).as_bytes()).await?;
     sock.write_all(format!("Host: {}\r\n", hostname).as_bytes())
         .await?;
     sock.write_all(b"Upgrade: websocket\r\n").await?;
@@ -490,6 +490,7 @@ async fn websocket_test(
     event_sender: leo_async::mpsc::Sender<JsonValue>,
     hostname: String,
     port: u16,
+    endpoint: String,
 ) -> DSSResult<()> {
     let addresses = {
         let hostname = hostname.clone();
@@ -508,7 +509,7 @@ async fn websocket_test(
     let mut client = TlsClient::connect(&hostname, addr).await?;
 
     // Do handshake
-    websocket_handshake(&mut client, hostname.as_str()).await?;
+    websocket_handshake(&mut client, hostname.as_str(), endpoint.as_str()).await?;
     info!("WebSocket handshake completed");
 
     write_websocket_packet(&mut client, WebsocketPacket::Ping(b"hey there :)".to_vec())).await?;
@@ -533,7 +534,7 @@ async fn websocket_test(
                 })
                 .await?;
                 if json.is_array() && json.len() == 3 {
-                    metrics::RECEIVED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::RECEIVED_EVENTS.inc();
                     let event = &json[2];
                     event_sender
                         .send(event.clone())
@@ -555,9 +556,10 @@ async fn tls_websocket_task(
     sender: leo_async::mpsc::Sender<JsonValue>,
     hostname: String,
     port: u16,
+    endpoint: String,
 ) -> DSSResult<()> {
     loop {
-        let result = websocket_test(sender.clone(), hostname.clone(), port).await;
+        let result = websocket_test(sender.clone(), hostname.clone(), port, endpoint.clone()).await;
         match result {
             Ok(_) => {
                 info!("Connection closed but no error?");
@@ -606,7 +608,11 @@ async fn message_to_ch_task(recv: leo_async::mpsc::Receiver<json::JsonValue>) ->
             Some(msg) => {
                 event_buffer.push_back(msg);
 
-                if event_buffer.len() == 64 {
+                let chunk_size = 512;
+
+                if event_buffer.len() == chunk_size {
+                    metrics::CLICKHOUSE_WRITTEN_EVENTS.inc_by(chunk_size as u64);
+
                     let sock = match ch_addr {
                         SocketAddr::V4(_) => leo_async::socket::socket()?,
                         SocketAddr::V6(_) => leo_async::socket::socket6()?,
@@ -669,7 +675,14 @@ async fn async_main() -> DSSResult<()> {
     let relays = relay_list.lines().collect::<Vec<&str>>();
 
     for relay in relays {
-        let url = url::Url::parse(relay)?;
+        let url = match url::Url::parse(relay) {
+            Ok(url) => url,
+            Err(e) => {
+                error!("Error parsing URL: {} ({})", e, relay);
+                continue;
+            }
+        };
+
         if url.scheme() != "wss" {
             continue;
         }
@@ -677,10 +690,13 @@ async fn async_main() -> DSSResult<()> {
         let hostname = url.host_str().ok_or("No hostname in URL")?;
         let port = url.port().unwrap_or(443);
 
+        let endpoint = url.path();
+
         leo_async::spawn(tls_websocket_task(
             event_sender.clone(),
             hostname.to_string(),
             port,
+            endpoint.to_string(),
         ));
     }
 

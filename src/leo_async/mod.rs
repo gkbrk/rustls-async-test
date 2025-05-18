@@ -10,7 +10,7 @@ use std::{
 
 use crossbeam::queue::SegQueue;
 
-use crate::{error, info, trace};
+use crate::{error, info, metrics, trace, AtomicU64Metric};
 pub(crate) use async_read::{AsyncRead, AsyncWrite};
 
 mod async_read;
@@ -55,6 +55,7 @@ fn make_threadpool(
         std::thread::spawn(move || {
             while let Ok(f) = rx.recv() {
                 f();
+                metrics::THREADPOOL_COMPLETED_TASKS.inc();
             }
         });
     }
@@ -386,8 +387,6 @@ fn run_forever(task_receiver: Arc<SegQueue<Arc<Task>>>) {
             }
         }
 
-        crate::trace!("Running {} tasks", task_set.len());
-
         for (_, task) in task_set.drain() {
             let _timer = noisytimer("future poll", 1500);
             let waker = std::task::Waker::from(task.clone());
@@ -400,9 +399,6 @@ fn run_forever(task_receiver: Arc<SegQueue<Arc<Task>>>) {
                     // Not done, put it back
                     *future_slot = Some(future);
                 }
-            } else {
-                // This should never happen
-                error!("Task with no future");
             }
         }
     }

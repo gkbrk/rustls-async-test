@@ -9,6 +9,28 @@ use std::{
 use crate::{ArcFd, DSSResult, error, fd_check_nonblocking, info, leo_async};
 
 pub(crate) static RECEIVED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CLICKHOUSE_WRITTEN_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static THREADPOOL_COMPLETED_TASKS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) trait AtomicU64Metric {
+    fn get(&self) -> u64;
+    fn inc(&self);
+    fn inc_by(&self, n: u64);
+}
+
+impl AtomicU64Metric for AtomicU64 {
+    fn get(&self) -> u64 {
+        self.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn inc(&self) {
+        self.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn inc_by(&self, n: u64) {
+        self.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 fn fd_make_nonblocking(fd: &ArcFd) -> DSSResult<()> {
     let fd = fd.as_raw_fd();
@@ -146,7 +168,17 @@ async fn handle_connection(fd: leo_async::ArcFd) -> DSSResult<()> {
             writeln!(
                 &mut writer,
                 "received_events {}",
-                RECEIVED_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+                RECEIVED_EVENTS.get()
+            )?;
+            writeln!(
+                &mut writer,
+                "threadpool_completed_tasks {}",
+                THREADPOOL_COMPLETED_TASKS.get()
+            )?;
+            writeln!(
+                &mut writer,
+                "clickhouse_written_events {}",
+                CLICKHOUSE_WRITTEN_EVENTS.get()
             )?;
             writer.flush().await?;
         }
