@@ -1,12 +1,11 @@
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr},
     os::fd::AsRawFd,
     sync::atomic::AtomicU64,
 };
 
-use crate::{ArcFd, DSSResult, error, fd_check_nonblocking, info, leo_async};
+use crate::{ArcFd, DSSResult, error, info, leo_async};
 
 pub(crate) static RECEIVED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CLICKHOUSE_WRITTEN_EVENTS: AtomicU64 = AtomicU64::new(0);

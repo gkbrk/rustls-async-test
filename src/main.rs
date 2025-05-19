@@ -28,8 +28,7 @@ impl Read for ArcFd {
                 std::io::ErrorKind::WouldBlock,
                 "read would block",
             )),
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(e) => Err(std::io::Error::other(
                 format!("Failed to read from fd {}: {}", raw_fd, e),
             )),
         }

@@ -1,16 +1,16 @@
 use std::{
     collections::HashMap,
     future::Future,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex, OnceLock, RwLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
     task::{Poll, Waker},
     time::Instant,
 };
 
 use crossbeam::queue::SegQueue;
 
-use crate::{AtomicU64Metric, error, info, metrics, trace};
+use crate::{AtomicU64Metric, metrics, trace};
 pub(crate) use async_read::{AsyncRead, AsyncWrite};
 
 mod async_read;
@@ -263,7 +263,7 @@ pub(super) fn fd_writable(fd: &ArcFd) -> DSSResult<bool> {
 
 pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     internal_poll_fn(move |cx| {
-        if { fd_readable(fd)? } {
+        if fd_readable(fd)? {
             return Poll::Ready(Ok(()));
         }
 
@@ -279,7 +279,7 @@ pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>
 
 pub(super) fn fd_wait_writable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>> + '_ {
     internal_poll_fn(move |cx| {
-        if { fd_writable(fd)? } {
+        if fd_writable(fd)? {
             return Poll::Ready(Ok(()));
         }
 
@@ -502,14 +502,14 @@ pub(super) mod socket {
         let res = unsafe { libc::connect(sock.as_raw_fd(), addr, size) };
 
         match res {
-            0 => return Ok(()),
+            0 => Ok(()),
             -1 => match get_errno() {
                 libc::EINPROGRESS | libc::EALREADY => {
                     fd_wait_writable(sock).await?;
-                    return Ok(());
+                    Ok(())
                 }
-                libc::EISCONN => return Ok(()),
-                _ => return Err(format!("connect failed: {}", get_errno()).into()),
+                libc::EISCONN => Ok(()),
+                _ => Err(format!("connect failed: {}", get_errno()).into()),
             },
             _ => unreachable!(),
         }
@@ -824,7 +824,7 @@ where
 mod epoll {
     use std::{
         collections::HashMap,
-        os::fd::{AsRawFd, BorrowedFd, RawFd},
+        os::fd::{BorrowedFd, RawFd},
         sync::{Arc, Mutex},
         task::Waker,
     };
