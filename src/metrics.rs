@@ -14,6 +14,7 @@ pub(crate) static THREADPOOL_COMPLETED_TASKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) trait AtomicU64Metric {
     fn get(&self) -> u64;
+    fn set(&self, n: u64);
     fn inc(&self);
     fn inc_by(&self, n: u64);
 }
@@ -21,6 +22,10 @@ pub(crate) trait AtomicU64Metric {
 impl AtomicU64Metric for AtomicU64 {
     fn get(&self) -> u64 {
         self.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self, n: u64) {
+        self.store(n, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn inc(&self) {
@@ -36,13 +41,15 @@ fn fd_make_nonblocking(fd: &ArcFd) -> DSSResult<()> {
     let fd = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 {
-        return Err("fcntl failed".into());
+        let errno = nix::errno::Errno::last();
+        return Err(format!("fcntl failed: {}", errno).into());
     }
 
     let flags = flags | libc::O_NONBLOCK;
     let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
     if res == -1 {
-        return Err("fcntl failed".into());
+        let errno = nix::errno::Errno::last();
+        return Err(format!("fcntl failed: {}", errno).into());
     }
 
     Ok(())
@@ -165,11 +172,7 @@ async fn handle_connection(fd: leo_async::ArcFd) -> DSSResult<()> {
             write!(&mut writer, "\r\n")?;
 
             // Write metrics
-            writeln!(
-                &mut writer,
-                "received_events {}",
-                RECEIVED_EVENTS.get()
-            )?;
+            writeln!(&mut writer, "received_events {}", RECEIVED_EVENTS.get())?;
             writeln!(
                 &mut writer,
                 "threadpool_completed_tasks {}",
@@ -209,8 +212,8 @@ pub(crate) async fn metrics_server() -> DSSResult<()> {
             continue;
         }
         match nix::sys::socket::accept(socket.as_raw_fd()) {
-            Ok(rawFd) => {
-                let fd = leo_async::ArcFd::from_raw_fd(rawFd);
+            Ok(raw_fd) => {
+                let fd = leo_async::ArcFd::from_raw_fd(raw_fd);
                 fd_make_nonblocking(&fd)?;
 
                 let req_handler = handle_connection(fd);

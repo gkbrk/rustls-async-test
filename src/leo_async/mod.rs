@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     pin::Pin,
     sync::{Arc, LazyLock, Mutex, OnceLock, RwLock},
     task::{Poll, Waker},
@@ -10,7 +10,7 @@ use std::{
 
 use crossbeam::queue::SegQueue;
 
-use crate::{error, info, metrics, trace, AtomicU64Metric};
+use crate::{AtomicU64Metric, error, info, metrics, trace};
 pub(crate) use async_read::{AsyncRead, AsyncWrite};
 
 mod async_read;
@@ -86,13 +86,28 @@ pub(crate) fn noisytimer(s: &'_ str, microseconds: u64) -> impl Drop + '_ {
     )
 }
 
+struct MyOwnedFd {
+    fd: RawFd,
+}
+
+impl Drop for MyOwnedFd {
+    fn drop(&mut self) {
+        // info!("closing fd {}", self.fd);
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 pub(crate) struct ArcFd {
-    fd: Arc<OwnedFd>,
+    fd: Arc<MyOwnedFd>,
 }
 
 impl ArcFd {
     pub(crate) fn from_owned_fd(fd: OwnedFd) -> Self {
-        ArcFd { fd: Arc::new(fd) }
+        let raw_fd = fd.as_raw_fd();
+        std::mem::forget(fd);
+        ArcFd {
+            fd: Arc::new(MyOwnedFd { fd: raw_fd }),
+        }
     }
 
     pub(crate) fn dup(&self) -> DSSResult<Self> {
@@ -106,7 +121,7 @@ impl ArcFd {
 
     pub(crate) fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
         ArcFd {
-            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
+            fd: Arc::new(MyOwnedFd { fd }),
         }
     }
 }
@@ -127,13 +142,13 @@ impl std::hash::Hash for ArcFd {
 
 impl AsRawFd for ArcFd {
     fn as_raw_fd(&self) -> i32 {
-        self.fd.as_raw_fd()
+        self.fd.fd
     }
 }
 
 impl AsFd for ArcFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) }
+        unsafe { BorrowedFd::borrow_raw(self.fd.fd) }
     }
 }
 
@@ -170,20 +185,19 @@ static THREADPOOL_SENDER: OnceLock<crossbeam::channel::Sender<Box<dyn FnOnce() +
 
 static TASK_SENDER: OnceLock<Arc<SegQueue<Arc<Task>>>> = OnceLock::new();
 
-static EPOLL_REGISTER: LazyLock<mpsc::Sender<(ArcFd, epoll::PollType, Waker)>> =
+static EPOLL_REGISTER: LazyLock<mpsc::Sender<(RawFd, epoll::PollType, Waker)>> =
     LazyLock::new(epoll::epoll_task);
 
-static SLEEP_REGISTER: LazyLock<std::sync::mpsc::Sender<(Instant, Box<Waker>)>> =
-    LazyLock::new(|| {
-        let (sender, receiver) = std::sync::mpsc::channel();
+static SLEEP_REGISTER: LazyLock<std::sync::mpsc::Sender<(Instant, Waker)>> = LazyLock::new(|| {
+    let (sender, receiver) = std::sync::mpsc::channel();
 
-        std::thread::Builder::new()
-            .name("sleep-task".to_string())
-            .spawn(|| sleep::sleep_task(receiver))
-            .expect("Failed to spawn sleep task");
+    std::thread::Builder::new()
+        .name("sleep-task".to_string())
+        .spawn(|| sleep::sleep_task(receiver))
+        .expect("Failed to spawn sleep task");
 
-        sender
-    });
+    sender
+});
 
 pub(super) fn read_fd<'a>(
     fd: &'a ArcFd,
@@ -193,7 +207,7 @@ pub(super) fn read_fd<'a>(
         Ok(n) => Poll::Ready(Ok(n)),
         Err(nix::errno::Errno::EAGAIN) => {
             EPOLL_REGISTER
-                .send((fd.clone(), epoll::PollType::Read, cx.waker().clone()))
+                .send((fd.as_raw_fd(), epoll::PollType::Read, cx.waker().clone()))
                 .unwrap();
             Poll::Pending
         }
@@ -209,7 +223,7 @@ pub(super) fn write_fd<'a>(
         Ok(n) => Poll::Ready(Ok(n)),
         Err(nix::errno::Errno::EAGAIN) => {
             EPOLL_REGISTER
-                .send((fd.clone(), epoll::PollType::Write, cx.waker().clone()))
+                .send((fd.as_raw_fd(), epoll::PollType::Write, cx.waker().clone()))
                 .unwrap();
             Poll::Pending
         }
@@ -255,7 +269,7 @@ pub(super) fn fd_wait_readable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>
 
         // Register interest in the file descriptor being readable
         EPOLL_REGISTER
-            .send((fd.clone(), epoll::PollType::Read, cx.waker().clone()))
+            .send((fd.as_raw_fd(), epoll::PollType::Read, cx.waker().clone()))
             .unwrap();
 
         // Return pending, the waker will be called when the fd is readable
@@ -271,7 +285,7 @@ pub(super) fn fd_wait_writable(fd: &ArcFd) -> impl Future<Output = DSSResult<()>
 
         // Register interest in the file descriptor being writable
         EPOLL_REGISTER
-            .send((fd.clone(), epoll::PollType::Write, cx.waker().clone()))
+            .send((fd.as_raw_fd(), epoll::PollType::Write, cx.waker().clone()))
             .unwrap();
 
         // Return pending, the waker will be called when the fd is writable
@@ -415,9 +429,7 @@ pub(super) fn sleep_seconds(seconds: impl Into<f64>) -> impl Future<Output = ()>
             Poll::Ready(())
         } else {
             // Register a sleep waker
-            SLEEP_REGISTER
-                .send((target, Box::new(cx.waker().clone())))
-                .unwrap();
+            SLEEP_REGISTER.send((target, cx.waker().clone())).unwrap();
             Poll::Pending
         }
     })
@@ -666,7 +678,7 @@ where
 
 pub(super) fn timeout_future<F, T>(future: F, timeout: std::time::Duration) -> TimeoutFuture<F, T>
 where
-    F: Future<Output = T> + Unpin,
+    F: Future<Output = T>,
 {
     TimeoutFuture {
         future,
@@ -702,7 +714,7 @@ where
             Poll::Pending => {
                 crate::trace!("Registering a timeout waker");
                 let waker = cx.waker().clone();
-                SLEEP_REGISTER.send((timeout_at, Box::new(waker))).unwrap();
+                SLEEP_REGISTER.send((timeout_at, waker)).unwrap();
                 Poll::Pending
             }
         }
@@ -812,14 +824,12 @@ where
 mod epoll {
     use std::{
         collections::HashMap,
-        os::fd::{AsRawFd, BorrowedFd},
+        os::fd::{AsRawFd, BorrowedFd, RawFd},
         sync::{Arc, Mutex},
         task::Waker,
     };
 
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
-
-    use super::ArcFd;
 
     #[derive(PartialEq, Eq, Hash, Debug)]
     pub enum PollType {
@@ -827,10 +837,9 @@ mod epoll {
         Write,
     }
 
-    struct ArcFdAndWaker(ArcFd, Waker);
-    type WakerHashMap = HashMap<i32, ArcFdAndWaker>;
+    type WakerHashMap = HashMap<RawFd, Waker>;
 
-    pub fn epoll_task() -> super::mpsc::Sender<(ArcFd, PollType, Waker)> {
+    pub fn epoll_task() -> super::mpsc::Sender<(RawFd, PollType, Waker)> {
         let (sender, receiver) = super::mpsc::channel();
         let epoll = Arc::new(Epoll::new(EpollCreateFlags::empty()).unwrap());
         let waker_hashmap: Arc<Mutex<WakerHashMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -860,8 +869,10 @@ mod epoll {
             for event in events.iter().take(n) {
                 let fd = event.data() as i32;
 
-                if let Some(ArcFdAndWaker(_fd, waker)) = waker_hashmap.remove(&fd) {
+                if let Some(waker) = waker_hashmap.remove(&fd) {
                     waker.wake();
+                } else {
+                    crate::warn!("epoll waker: no waker found for fd {}", fd);
                 }
             }
         }
@@ -870,7 +881,7 @@ mod epoll {
     async fn epoll_register_task(
         epoll: Arc<Epoll>,
         waker_hashmap: Arc<Mutex<WakerHashMap>>,
-        receiver: super::mpsc::Receiver<(ArcFd, PollType, Waker)>,
+        receiver: super::mpsc::Receiver<(RawFd, PollType, Waker)>,
     ) {
         while let Some((fd, polltype, waker)) = receiver.recv().await {
             let flags = match polltype {
@@ -878,21 +889,23 @@ mod epoll {
                 PollType::Write => EpollFlags::EPOLLOUT | EpollFlags::EPOLLONESHOT,
             };
 
-            let raw_fd = fd.as_raw_fd();
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-            let _ = waker_hashmap
-                .lock()
-                .unwrap()
-                .insert(raw_fd, ArcFdAndWaker(fd, waker));
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
 
-            let mut ev = EpollEvent::new(flags, raw_fd as u64);
+            let _ = waker_hashmap.lock().unwrap().insert(fd, waker);
+
+            let mut ev = EpollEvent::new(flags, fd as u64);
 
             match epoll.modify(borrowed_fd, &mut ev) {
                 Ok(_) => {}
                 // If the file descriptor is not found in the epoll instance, add it instead of modifying.
-                Err(nix::errno::Errno::ENOENT) => epoll.add(borrowed_fd, ev).unwrap(),
+                Err(nix::errno::Errno::ENOENT) => match epoll.add(borrowed_fd, ev) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        crate::error!("epoll add failed: {:?}", e);
+                    }
+                },
                 Err(e) => {
-                    panic!("epoll modify failed: {:?}", e);
+                    crate::error!("epoll modify failed: {:?}", e);
                 }
             }
         }
@@ -902,7 +915,7 @@ mod epoll {
 mod sleep {
     use std::{collections::BinaryHeap, task::Waker, time::Instant};
 
-    struct InstantAndWaker(Instant, Box<Waker>);
+    struct InstantAndWaker(Instant, Waker);
 
     impl PartialEq for InstantAndWaker {
         fn eq(&self, other: &Self) -> bool {
@@ -924,7 +937,7 @@ mod sleep {
         }
     }
 
-    pub(super) fn sleep_task(recv: std::sync::mpsc::Receiver<(Instant, Box<Waker>)>) {
+    pub(super) fn sleep_task(recv: std::sync::mpsc::Receiver<(Instant, Waker)>) {
         let mut sleep_queue: BinaryHeap<InstantAndWaker> = BinaryHeap::new();
 
         loop {

@@ -45,10 +45,10 @@ impl Write for ArcFd {
                 std::io::ErrorKind::WouldBlock,
                 "write would block",
             )),
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to write to fd {}: {}", raw_fd, e),
-            )),
+            Err(e) => Err(std::io::Error::other(format!(
+                "Failed to write to fd {}: {}",
+                raw_fd, e
+            ))),
         }
     }
 
@@ -131,36 +131,27 @@ impl TlsClient {
 
         let sock = connect(&addr).await?;
 
-        let read_sock = sock.dup()?;
-        let write_sock = sock.dup()?;
-
-        fd_check_nonblocking(&sock)?;
-        fd_check_nonblocking(&read_sock)?;
-        fd_check_nonblocking(&write_sock)?;
-
         Ok(Self {
             client: client.cowboy(),
-            read_sock,
-            write_sock,
+            read_sock: sock.dup()?,
+            write_sock: sock,
         })
     }
 
     async fn run_iter(&mut self) -> DSSResult<(bool, bool)> {
         leo_async::yield_now().await;
-        let mut read_sock = self.read_sock.clone();
-        let mut write_sock = self.write_sock.clone();
 
         match { (self.client.r().wants_read(), self.client.r().wants_write()) } {
             (false, false) => return Ok((false, false)),
             (true, false) => {
-                fd_wait_readable(&read_sock).await?;
+                fd_wait_readable(&self.read_sock).await?;
             }
             (false, true) => {
-                fd_wait_writable(&write_sock).await?;
+                fd_wait_writable(&self.write_sock).await?;
             }
             (true, true) => {
-                let read_fut = fd_wait_readable(&read_sock);
-                let write_fut = fd_wait_writable(&write_sock);
+                let read_fut = fd_wait_readable(&self.read_sock);
+                let write_fut = fd_wait_writable(&self.write_sock);
                 leo_async::select2_noresult(read_fut, write_fut).await;
             }
         };
@@ -168,9 +159,9 @@ impl TlsClient {
         leo_async::yield_now().await;
 
         if self.client.r().wants_read() {
-            let readable = { leo_async::fd_readable(&read_sock)? };
+            let readable = { leo_async::fd_readable(&self.read_sock)? };
             if readable {
-                match { self.client.w().read_tls(&mut read_sock) } {
+                match { self.client.w().read_tls(&mut self.read_sock) } {
                     Ok(0) => {
                         // EOF
                         return Ok((false, false));
@@ -191,9 +182,9 @@ impl TlsClient {
         leo_async::yield_now().await;
 
         if self.client.r().wants_write() {
-            let writable = { leo_async::fd_writable(&write_sock)? };
+            let writable = { leo_async::fd_writable(&self.write_sock)? };
             if writable {
-                match self.client.w().write_tls(&mut write_sock) {
+                match self.client.w().write_tls(&mut self.write_sock) {
                     Ok(0) => {
                         // EOF
                         return Ok((false, false));
@@ -282,8 +273,13 @@ impl TlsClient {
     }
 }
 
-async fn websocket_handshake(sock: &mut TlsClient, hostname: &str, endpoint: &str) -> DSSResult<()> {
-    sock.write_all(format!("GET {} HTTP/1.1\r\n", endpoint).as_bytes()).await?;
+async fn websocket_handshake(
+    sock: &mut TlsClient,
+    hostname: &str,
+    endpoint: &str,
+) -> DSSResult<()> {
+    sock.write_all(format!("GET {} HTTP/1.1\r\n", endpoint).as_bytes())
+        .await?;
     sock.write_all(format!("Host: {}\r\n", hostname).as_bytes())
         .await?;
     sock.write_all(b"Upgrade: websocket\r\n").await?;
@@ -426,8 +422,8 @@ async fn read_websocket_packet(sock: &mut TlsClient) -> DSSResult<WebsocketPacke
         buf
     };
 
-    for i in 0..header.payload_len as usize {
-        payload[i] ^= header.masking_key[i % 4];
+    for (i, byte) in payload.iter_mut().enumerate() {
+        *byte ^= header.masking_key[i % 4];
     }
 
     let packet = match header.opcode {
@@ -494,17 +490,16 @@ async fn websocket_test(
 ) -> DSSResult<()> {
     let addresses = {
         let hostname = hostname.clone();
-        let result = leo_async::fn_thread_future(move || -> DSSResult<Vec<SocketAddr>> {
+        leo_async::fn_thread_future(move || -> DSSResult<Vec<SocketAddr>> {
             match ToSocketAddrs::to_socket_addrs(&(hostname, port)) {
                 Ok(x) => Ok(x.collect()),
                 Err(e) => Err(e.to_string().into()),
             }
         })
-        .await?;
-        result
+        .await?
     };
 
-    let addr = addresses.iter().next().ok_or("No address found")?.clone();
+    let addr = *addresses.first().ok_or("No address found")?;
 
     let mut client = TlsClient::connect(&hostname, addr).await?;
 
